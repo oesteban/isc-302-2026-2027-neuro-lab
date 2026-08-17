@@ -30,7 +30,6 @@ RUN mkdir -p /opt/afni-latest \
     --exclude "linux_openmp_64/lib/RetroTS" \
     --exclude "linux_openmp_64/lib_RetroTS" \
     --exclude "linux_openmp_64/meica.libs" \
-    # && /opt/afni-latest/@update.afni.binaries -package linux_openmp_64 -do_extras -quiet \
     # Keep only what we use
     && find /opt/afni-latest -type f -not \( \
             -name "3dAFNItoNIFTI" \
