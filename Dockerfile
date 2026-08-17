@@ -126,14 +126,16 @@ ENV PATH="${CONDA_PATH}/bin:$PATH" \
     CPATH="${CONDA_PATH}/include:$CPATH" \
     LD_LIBRARY_PATH="${CONDA_PATH}/lib:$LD_LIBRARY_PATH"
 
-RUN mkdir $HOME/data $HOME/outputs $HOME/.local \
-    && chmod 1777 $HOME/.local \
+RUN mkdir -p $HOME/data $HOME/outputs $HOME/work $HOME/.local $HOME/src \
+    && chmod 1777 $HOME/data $HOME/outputs $HOME/work $HOME/.local $HOME/src \
     && datalad clone https://github.com/OpenNeuroDatasets/ds000005 $HOME/data/ds000005 \
     && datalad get -d $HOME/data/ds000005 $HOME/data/ds000005/sub-01/anat/sub-01_T1w.nii.gz
 
+COPY brain_mri_pipeline.ipynb /home/databot/src/
+
 WORKDIR /home/databot/work
 
-COPY brain_mri_pipeline.ipynb .
+RUN ln -s /home/databot/src/brain_mri_pipeline.ipynb .
 
 EXPOSE 8888
 
