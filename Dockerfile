@@ -7,11 +7,19 @@
 ARG PYTHON_TAG=3.12-slim-trixie
 
 # --- 1. The SynthStrip payload ----------------------------------------------
-# Pinned to amd64 because the official image HAS no arm64 manifest. That is fine,
-# and it is the whole trick: nothing from this stage is ever EXECUTED. We take a
-# Python script and 31 MB of PyTorch tensors -- both are just bytes, identical on
-# every CPU -- and we leave /freesurfer/env, which is the arch-specific part.
-FROM --platform=linux/amd64 freesurfer/synthstrip:1.8 AS synthstrip
+# Pinned to amd64 because the official image HAS no arm64 manifest, so without
+# this the stage cannot be resolved at all when building on Apple silicon.
+#
+# It is safe, and it is the whole trick: nothing from this stage is ever
+# EXECUTED. We take a Python script and 31 MB of PyTorch tensors -- both are
+# just bytes, identical on every CPU -- and we leave /freesurfer/env behind,
+# which is the arch-specific part.
+#
+# BuildKit lints a constant --platform as a likely mistake, which it usually is.
+# Carrying it in an ARG says the value was chosen rather than forgotten, and
+# lets anyone override it if an arm64 build of that image ever appears.
+ARG SYNTHSTRIP_PLATFORM=linux/amd64
+FROM --platform=${SYNTHSTRIP_PLATFORM} freesurfer/synthstrip:1.8 AS synthstrip
 
 # --- 2. The dataset ----------------------------------------------------------
 # $BUILDPLATFORM is the machine doing the building, so this runs natively for both
