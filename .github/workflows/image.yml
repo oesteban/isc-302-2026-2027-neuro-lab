@@ -1,0 +1,139 @@
+# Build the lab image for both architectures and publish it to Docker Hub.
+#
+# The two architectures are built by two runners, each on its own hardware, and
+# then stitched into one tag. That is deliberate: the alternative is emulating
+# arm64 on an x86 runner with QEMU, which works but turns a four-minute build
+# into a thirty-minute one, because this image compiles surfa's Cython
+# extensions from source and QEMU is at its worst on exactly that.
+#
+# Each build job pushes an untagged image and reports its digest. The merge job
+# collects the digests and creates the tags, so a tag never exists pointing at
+# only half the architectures.
+name: image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - scripts/**
+      - brain_mri_pipeline.ipynb
+      - .github/workflows/image.yml
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (default: today, as YYYY.MM.DD)"
+        required: false
+        type: string
+
+env:
+  IMAGE: oesteban/neuropipeline-302
+
+jobs:
+  build:
+    name: build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          # Native arm64 if this account has arm64 hosted runners; otherwise set
+          # the repository variable ARM64_RUNNER to ubuntu-24.04 and the QEMU step
+          # below turns itself on. Native is a ~4 minute build, emulated is ~30,
+          # because this image compiles surfa's Cython extensions from source.
+          - platform: linux/arm64
+            runner: ${{ vars.ARM64_RUNNER || 'ubuntu-24.04-arm' }}
+    # An emulated arm64 build is slow; do not let the default 6 hours hide a hang.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Name this platform
+        id: platform
+        run: echo "pair=${{ matrix.platform }}" | tr '/' '-' >> "$GITHUB_OUTPUT"
+
+      # Only when the runner's own architecture does not match the target. On a
+      # native arm64 runner this is skipped and nothing is emulated.
+      - name: Set up QEMU (only if cross-building)
+        if: matrix.platform == 'linux/arm64' && runner.arch != 'ARM64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          # No tag here. The merge job owns the tags; these are anonymous
+          # manifests that exist only to be collected.
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ steps.platform.outputs.pair }}
+          cache-to: type=gha,mode=max,scope=${{ steps.platform.outputs.pair }}
+
+      - name: Record the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ steps.platform.outputs.pair }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: stitch the manifest
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Work out the tags
+        id: tags
+        run: |
+          requested="${{ inputs.tag }}"
+          version="${requested:-$(date -u +%Y.%m.%d)}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "args=-t $IMAGE:$version -t $IMAGE:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Create the manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create ${{ steps.tags.outputs.args }} \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Show what landed
+        run: |
+          docker buildx imagetools inspect "$IMAGE:${{ steps.tags.outputs.version }}"
+
+      - name: Fail if either architecture is missing
+        run: |
+          got=$(docker buildx imagetools inspect --raw "$IMAGE:${{ steps.tags.outputs.version }}" \
+                | grep -c '"architecture"' || true)
+          echo "architectures in the manifest: $got"
+          test "$got" -ge 2
