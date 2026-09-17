@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Tissue volumes from a discrete segmentation, as a TSV.
+
+The third task in the pipeline. It does no science: it counts voxels and
+multiplies by how big a voxel is. That is worth noticing -- most of the tasks in
+a real pipeline are this kind of task, and a pipeline is mostly plumbing between
+the two or three steps that are not.
+"""
+import argparse
+import csv
+import sys
+
+import nibabel as nb
+import numpy as np
+
+LABELS = {1: "CSF", 2: "GM", 3: "WM"}
+
+p = argparse.ArgumentParser(
+    description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+)
+p.add_argument("input", help="discrete segmentation (NIfTI), 1=CSF 2=GM 3=WM")
+p.add_argument("output", nargs="?", help="TSV to write (default: standard output)")
+args = p.parse_args()
+
+img = nb.load(args.input)
+data = np.asanyarray(img.dataobj)
+
+# Voxel volume in millilitres. get_zooms() is in millimetres, and there are
+# 1000 cubic millimetres in a millilitre.
+voxel_mL = float(np.prod(img.header.get_zooms()[:3])) / 1000.0
+
+rows = []
+for value, name in sorted(LABELS.items()):
+    n = int((data == value).sum())
+    rows.append({"tissue": name, "label": value, "voxels": n, "volume_mL": round(n * voxel_mL, 2)})
+
+handle = open(args.output, "w", newline="") if args.output else sys.stdout
+with handle as fh:
+    writer = csv.DictWriter(
+        fh, fieldnames=["tissue", "label", "voxels", "volume_mL"], delimiter="\t"
+    )
+    writer.writeheader()
+    writer.writerows(rows)
+
+if args.output:
+    print(f"Wrote {args.output}")
+    for row in rows:
+        print(f"  {row['tissue']:<3s} {row['volume_mL']:9.2f} mL")

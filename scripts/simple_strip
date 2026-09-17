@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Brain extraction by thresholding and morphology. The low-memory path.
+
+`mri_synthstrip` is the better tool and it is what this pipeline calls first.
+It is also a U-Net, and it wants about 6 GB of RAM, which is more than Docker
+Desktop is given on a laptop with 8 GB in it. This script exists so that the
+pipeline still runs on those machines.
+
+The method is the one everybody wrote before the learned models arrived:
+
+  1. blur, so that noise does not fragment the threshold;
+  2. threshold with Otsu's method, splitting the histogram into "tissue" and
+     "background" at the point that minimises the variance within each;
+  3. erode, to snap the thin bridges that connect brain to skull and scalp;
+  4. keep the largest connected component, on the assumption that the brain is
+     the biggest single blob of tissue in a head;
+  5. dilate back by what was eroded, and fill the holes.
+
+It costs about half a gigabyte and a couple of seconds. It is also visibly
+worse than SynthStrip, especially around the eyes and the neck, and comparing
+the two masks is a more honest exercise than trusting either.
+
+The command line deliberately mirrors mri_synthstrip's, so the pipeline can
+swap one for the other by changing a single word.
+"""
+import argparse
+
+import nibabel as nb
+import numpy as np
+from scipy import ndimage
+
+
+def otsu(values: np.ndarray, bins: int = 256) -> float:
+    """The threshold that minimises the intensity variance within each side."""
+    counts, edges = np.histogram(values, bins=bins)
+    centres = (edges[:-1] + edges[1:]) / 2.0
+    weight_lo = np.cumsum(counts)
+    weight_hi = weight_lo[-1] - weight_lo
+    # Guard the ends, where one side of the split is empty.
+    valid = (weight_lo > 0) & (weight_hi > 0)
+    cumsum = np.cumsum(counts * centres)
+    mean_lo = np.divide(cumsum, weight_lo, out=np.zeros_like(cumsum), where=weight_lo > 0)
+    mean_hi = np.divide(
+        cumsum[-1] - cumsum, weight_hi, out=np.zeros_like(cumsum), where=weight_hi > 0
+    )
+    between = weight_lo * weight_hi * (mean_lo - mean_hi) ** 2
+    between[~valid] = -1
+    return float(centres[int(np.argmax(between))])
+
+
+p = argparse.ArgumentParser(
+    description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+)
+p.add_argument("-i", "--image", required=True, help="input image to skullstrip")
+p.add_argument("-o", "--out", help="save stripped image to file")
+p.add_argument("-m", "--mask", help="save binary brain mask to file")
+p.add_argument("-f", "--fill", type=float, default=0.0, help="background fill value")
+p.add_argument(
+    "--radius",
+    type=float,
+    default=6.0,
+    help="erosion radius in mm; raise it if skull stays attached, lower it if "
+    "the brain is eaten away (default: 6)",
+)
+args = p.parse_args()
+
+if not args.out and not args.mask:
+    p.error("nothing to do: give -o, -m, or both")
+
+img = nb.load(args.image)
+data = np.asanyarray(img.dataobj, dtype="float32")
+zooms = np.asarray(img.header.get_zooms()[:3], dtype="float32")
+
+# 1. blur, in millimetres rather than voxels, so anisotropic images behave
+smooth = ndimage.gaussian_filter(data, sigma=(1.0 / zooms))
+
+# 2. threshold
+thr = otsu(smooth[smooth > smooth.min()])
+fg = smooth > thr
+
+# 3. erode. The radius is in millimetres; convert per axis.
+iters = int(max(1, round(args.radius / float(zooms.max()))))
+eroded = ndimage.binary_erosion(fg, iterations=iters)
+
+# 4. the largest surviving blob is the brain
+labels, n = ndimage.label(eroded)
+if n == 0:
+    raise SystemExit("simple_strip: nothing survived the erosion; try --radius smaller")
+sizes = ndimage.sum_labels(np.ones_like(labels), labels, index=np.arange(1, n + 1))
+brain = labels == (int(np.argmax(sizes)) + 1)
+
+# 5. give back what erosion took, then close the holes it left inside
+mask = ndimage.binary_dilation(brain, iterations=iters)
+mask = ndimage.binary_fill_holes(mask)
+
+print(f"simple_strip: threshold {thr:.1f}, {n} components, erosion {iters} voxels")
+print(f"  brain: {int(mask.sum())} voxels "
+      f"({mask.sum() * float(np.prod(zooms)) / 1000.0:.0f} mL)")
+
+if args.mask:
+    out = nb.Nifti1Image(mask.astype("uint8"), img.affine)
+    out.set_data_dtype(np.uint8)
+    out.header.set_zooms(tuple(zooms))
+    out.to_filename(args.mask)
+    print(f"  binary brain mask saved to: {args.mask}")
+
+if args.out:
+    stripped = np.where(mask, data, args.fill).astype("float32")
+    out = nb.Nifti1Image(stripped, img.affine)
+    out.header.set_zooms(tuple(zooms))
+    out.to_filename(args.out)
+    print(f"  masked image saved to: {args.out}")

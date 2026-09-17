@@ -1,142 +1,112 @@
-# Ubuntu 22.04 LTS - Jammy
-ARG BASE_IMAGE=ubuntu:jammy-20240125
+# 302 neuro lab image. Multi-stage, and multi-arch (linux/amd64, linux/arm64).
+#
+# The multi-stage lesson the AFNI build used to carry is still here, and it is a
+# sharper one now: stages 1 and 2 exist because their OUTPUT is architecture-neutral
+# data, so they run once on the build host and feed both target architectures.
+# Stage 3 exists to throw a C toolchain away.
+ARG PYTHON_TAG=3.12-slim-trixie
 
+# --- 1. The SynthStrip payload ----------------------------------------------
+# Pinned to amd64 because the official image HAS no arm64 manifest. That is fine,
+# and it is the whole trick: nothing from this stage is ever EXECUTED. We take a
+# Python script and 31 MB of PyTorch tensors -- both are just bytes, identical on
+# every CPU -- and we leave /freesurfer/env, which is the arch-specific part.
+FROM --platform=linux/amd64 freesurfer/synthstrip:1.8 AS synthstrip
 
-# Utilities for downloading packages
-FROM ${BASE_IMAGE} as downloader
-# Bump the date to current to refresh curl/certificates/etc
-RUN echo "2024.03.18"
-RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive \
-    apt-get install -y --no-install-recommends \
-                    binutils \
-                    bzip2 \
-                    ca-certificates \
-                    curl \
-                    unzip && \
-    apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+# --- 2. The dataset ----------------------------------------------------------
+# $BUILDPLATFORM is the machine doing the building, so this runs natively for both
+# target legs and its result is shared. One 5 MB file, fetched over plain HTTPS.
+FROM --platform=$BUILDPLATFORM python:${PYTHON_TAG} AS data
+ARG T1W_URL=https://s3.amazonaws.com/openneuro.org/ds000005/sub-01/anat/sub-01_T1w.nii.gz
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /data/ds000005/sub-01/anat \
+    && curl -fsSL --retry 5 -o /data/ds000005/sub-01/anat/sub-01_T1w.nii.gz "${T1W_URL}"
 
-# AFNI
-FROM downloader as afni
-# Bump the date to current to update AFNI
-RUN echo "2024.03.18"
-RUN mkdir -p /opt/afni-latest \
-    && curl -fsSL --retry 5 https://afni.nimh.nih.gov/pub/dist/tgz/linux_openmp_64.tgz \
-    | tar -xz -C /opt/afni-latest --strip-components 1 \
-    --exclude "linux_openmp_64/*.gz" \
-    --exclude "linux_openmp_64/funstuff" \
-    --exclude "linux_openmp_64/shiny" \
-    --exclude "linux_openmp_64/afnipy" \
-    --exclude "linux_openmp_64/lib/RetroTS" \
-    --exclude "linux_openmp_64/lib_RetroTS" \
-    --exclude "linux_openmp_64/meica.libs" \
-    # Keep only what we use
-    && find /opt/afni-latest -type f -not \( \
-            -name "3dAFNItoNIFTI" \
-        -or -name "3dAutomask" \
-        -or -name "3dcalc" \
-        -or -name "3dFWHMx" \
-        -or -name "3dinfo" \
-        -or -name "3dmaskave" \
-        -or -name "3dSeg" \
-        -or -name "3dSkullStrip" \
-        -or -name "3dTnorm" \
-        -or -name "3dToutcount" \
-        -or -name "3dTqual" \
-        -or -name "3dTshift" \
-        -or -name "3dTstat" \
-        -or -name "3dUnifize" \
-        -or -name "3dvolreg" \
-        -or -name "afni" \
-       \) -delete
+# --- 3. surfa ----------------------------------------------------------------
+# surfa ships source-only on PyPI: two Cython extensions, so it needs a compiler.
+# Build the wheel here and leave build-essential behind.
+#
+# The pins are not arbitrary. They are the combination the official
+# freesurfer/synthstrip:1.8 image ships, read out of its own site-packages.
+# surfa 0.6.3 is BROKEN against this stack: it trips numpy 2's strictness in
+# reorient(), and then hands scipy a boolean mask that find_objects() rejects.
+FROM python:${PYTHON_TAG} AS wheels
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+# python:3.12-slim ships no setuptools, and --no-build-isolation needs one. The
+# isolation is disabled on purpose, so surfa compiles against the SAME numpy it
+# will run against rather than whatever pip would pick for the build.
+RUN pip install --no-cache-dir "setuptools" "wheel" "Cython>=3.0" "numpy==1.26.4" \
+    && pip wheel --no-cache-dir --wheel-dir /wheels "numpy==1.26.4" \
+    && pip wheel --no-cache-dir --no-build-isolation --wheel-dir /wheels "surfa==0.6.1"
 
-       # Use Ubuntu 20.04 LTS
-FROM nipreps/miniconda:py39_2403.0
+# --- 4. The lab image --------------------------------------------------------
+FROM python:${PYTHON_TAG}
 
 ARG DEBIAN_FRONTEND=noninteractive
-ENV LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:${CONDA_PATH}/lib"
-ENV CONDA_PATH="/opt/conda"
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
-# Configure PPAs for libpng12 and libxp6
-RUN GNUPGHOME=/tmp gpg --keyserver hkps://keyserver.ubuntu.com --no-default-keyring --keyring /usr/share/keyrings/linuxuprising.gpg --recv 0xEA8CACC073C3DB2A \
-    && GNUPGHOME=/tmp gpg --keyserver hkps://keyserver.ubuntu.com --no-default-keyring --keyring /usr/share/keyrings/zeehio.gpg --recv 0xA1301338A3A48C4A \
-    && echo "deb [signed-by=/usr/share/keyrings/linuxuprising.gpg] https://ppa.launchpadcontent.net/linuxuprising/libpng12/ubuntu jammy main" > /etc/apt/sources.list.d/linuxuprising.list \
-    && echo "deb [signed-by=/usr/share/keyrings/zeehio.gpg] https://ppa.launchpadcontent.net/zeehio/libxp/ubuntu jammy main" > /etc/apt/sources.list.d/zeehio.list
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git less \
+    && rm -rf /var/lib/apt/lists/*
 
-# Dependencies for AFNI; requires a discontinued multiarch-support package from bionic (18.04)
-RUN apt-get update -qq \
-    && apt-get install -y -q --no-install-recommends \
-           ed \
-           gsl-bin \
-           libglib2.0-0 \
-           libglu1-mesa-dev \
-           libglw1-mesa \
-           libgomp1 \
-           libjpeg62 \
-           libpng12-0 \
-           libxm4 \
-           libxp6 \
-           netpbm \
-           tcsh \
-           xfonts-base \
-           xvfb \
-    && curl -sSL --retry 5 -o /tmp/multiarch.deb http://archive.ubuntu.com/ubuntu/pool/main/g/glibc/multiarch-support_2.27-3ubuntu1.5_amd64.deb \
-    && dpkg -i /tmp/multiarch.deb \
-    && rm /tmp/multiarch.deb \
-    && apt-get install -f \
-    && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
-    && gsl2_path="$(find / -name 'libgsl.so.27' || printf '')" \
-    && if [ -n "$gsl2_path" ]; then \
-         ln -sfv "$gsl2_path" "$(dirname $gsl2_path)/libgsl.so.0"; \
-    fi \
-    && ldconfig
+# CPU-only torch. The default PyPI wheel drags in gigabytes of CUDA that nothing
+# here can use; from the CPU index it is 104 MB on aarch64, 184 MB on x86_64.
+RUN pip install --no-compile --index-url https://download.pytorch.org/whl/cpu "torch==2.9.1"
 
-# Install AFNI
-ENV AFNI_DIR="/opt/afni"
-COPY --from=afni /opt/afni-latest ${AFNI_DIR}
-ENV PATH="${AFNI_DIR}:$PATH" \
-    AFNI_IMSAVE_WARNINGS="NO" \
-    AFNI_MODELPATH="${AFNI_DIR}/models" \
-    AFNI_TTATLAS_DATASET="${AFNI_DIR}/atlases" \
-    AFNI_PLUGINPATH="${AFNI_DIR}/plugins"
+# One resolve, so nothing quietly drags numpy forward again. The constraint is
+# the point: surfa 0.6.1 is a numpy-1 package, and a later scikit-learn would
+# happily upgrade numpy underneath it and break skull-stripping at run time.
+RUN --mount=from=wheels,source=/wheels,target=/wheels \
+    printf '%s\n' "numpy==1.26.4" "scipy==1.15.3" > /tmp/constraints.txt \
+    && pip install --no-compile --find-links=/wheels --constraint /tmp/constraints.txt \
+        "surfa==0.6.1" \
+        numpy \
+        scipy \
+        nibabel \
+        scikit-learn \
+        niimath \
+        ipyniivue \
+        jupyter \
+        notebook \
+    && rm /tmp/constraints.txt \
+    && python -c "import numpy, surfa, sklearn, scipy; assert numpy.__version__.startswith('1.26'), numpy.__version__"
 
-# Install AFNI's dependencies
-RUN micromamba install -n base -c conda-forge "ants=2.5" \
-            && sync \
-	    && micromamba clean -afy; sync \
-	    && ldconfig
+# SynthStrip: the driver script and the weights, nothing else.
+ENV FREESURFER_HOME=/opt/synthstrip
+COPY --from=synthstrip /freesurfer/models/        ${FREESURFER_HOME}/models/
+COPY --from=synthstrip /freesurfer/mri_synthstrip /usr/local/bin/mri_synthstrip
 
-RUN python -m pip install ipyniivue jupyter
+COPY scripts/simple_strip scripts/tissue_segment scripts/tissue_volumes /usr/local/bin/
+RUN chmod +x /usr/local/bin/mri_synthstrip \
+             /usr/local/bin/simple_strip \
+             /usr/local/bin/tissue_segment \
+             /usr/local/bin/tissue_volumes \
+    # the niimath wheel ships its binary without the execute bit and its Python
+    # wrapper tries to chmod at import, which a non-root user cannot do
+    && chmod +x /usr/local/lib/python3.12/site-packages/niimath/bin/niimath
 
-# Create a shared $HOME directory
+# The recipe that built this image, inside the image. Week 1 day 2 asks you to
+# split it in two, and the lab repository is private, so this is where you read it.
+COPY Dockerfile /opt/302/Dockerfile
+
 RUN useradd -m -s /bin/bash -G users databot
-WORKDIR /home/databot
-ENV HOME="/home/databot"
-
-RUN chmod 755 /home/databot
-
 USER databot
+ENV HOME=/home/databot
+WORKDIR /home/databot
+RUN mkdir -p $HOME/outputs $HOME/work $HOME/src
 
-# Pacify datalad
-RUN git config --global user.name "302 data computation" \
-    && git config --global user.email "302@hes-so.ch"
-
-RUN micromamba shell init -s bash
-ENV PATH="${CONDA_PATH}/bin:$PATH" \
-    CPATH="${CONDA_PATH}/include:$CPATH" \
-    LD_LIBRARY_PATH="${CONDA_PATH}/lib:$LD_LIBRARY_PATH"
-
-RUN mkdir -p $HOME/data $HOME/outputs $HOME/work $HOME/.local $HOME/src \
-    && chmod 1777 $HOME/data $HOME/outputs $HOME/work $HOME/.local $HOME/src \
-    && datalad clone https://github.com/OpenNeuroDatasets/ds000005 $HOME/data/ds000005 \
-    && datalad get -d $HOME/data/ds000005 $HOME/data/ds000005/sub-01/anat/sub-01_T1w.nii.gz
-
-COPY brain_mri_pipeline.ipynb /home/databot/src/
+COPY --from=data --chown=databot:databot /data /home/databot/data
+COPY --chown=databot:databot brain_mri_pipeline.ipynb /home/databot/src/
 
 WORKDIR /home/databot/work
-
-RUN ln -s /home/databot/src/brain_mri_pipeline.ipynb .
+RUN ln -s ../src/brain_mri_pipeline.ipynb .
 
 EXPOSE 8888
 
-CMD ["jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root"]
+# No ENTRYPOINT on purpose: `docker run IMAGE mri_synthstrip ...` has to work,
+# because that is what a Compose "tools" service does.
+CMD ["jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser"]
