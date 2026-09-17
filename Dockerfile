@@ -68,7 +68,6 @@ RUN --mount=from=wheels,source=/wheels,target=/wheels \
         scipy \
         nibabel \
         scikit-learn \
-        SimpleITK \
         niimath \
         ipyniivue \
         jupyter \
@@ -81,15 +80,19 @@ ENV FREESURFER_HOME=/opt/synthstrip
 COPY --from=synthstrip /freesurfer/models/        ${FREESURFER_HOME}/models/
 COPY --from=synthstrip /freesurfer/mri_synthstrip /usr/local/bin/mri_synthstrip
 
-COPY scripts/simple_strip scripts/n4_correct scripts/tissue_segment scripts/tissue_volumes /usr/local/bin/
+COPY scripts/simple_strip scripts/tissue_segment scripts/tissue_volumes /usr/local/bin/
 RUN chmod +x /usr/local/bin/mri_synthstrip \
              /usr/local/bin/simple_strip \
-             /usr/local/bin/n4_correct \
              /usr/local/bin/tissue_segment \
              /usr/local/bin/tissue_volumes \
     # the niimath wheel ships its binary without the execute bit and its Python
     # wrapper tries to chmod at import, which a non-root user cannot do
-    && chmod +x /usr/local/lib/python3.12/site-packages/niimath/bin/niimath
+    # niimath's console script is a Python shim that chmod()s its own bundled
+    # binary at import, which a non-root user cannot do even when the bit is
+    # already set. Point the name straight at the binary instead.
+    && chmod +x /usr/local/lib/python3.12/site-packages/niimath/bin/niimath \
+    && ln -sf /usr/local/lib/python3.12/site-packages/niimath/bin/niimath \
+              /usr/local/bin/niimath
 
 # The recipe that built this image, inside the image. Week 1 day 2 asks you to
 # split it in two, and the lab repository is private, so this is where you read it.

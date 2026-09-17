@@ -31,8 +31,10 @@ surrounded by grey matter is asked to justify itself and usually cannot. It is
 the cheapest possible spatial prior and it is most of what separates this script
 from a tool you would actually publish with.
 
-Run it with `--mrf 0` to see what it is doing, and note that the argument to give
-the bias-corrected image matters at least as much: see `n4_correct`.
+Run it with `--mrf 0` to see what it is doing, and note that what you feed it
+matters at least as much: on the raw image this script finds 468 mL of white
+matter, and on the same image after `niimath -unifize` it finds 575 mL. The
+second is the believable one.
 """
 import argparse
 
