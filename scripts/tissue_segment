@@ -23,8 +23,16 @@ A grey-to-white ratio of 2.5 is not anatomy, it is one broad Gaussian swallowing
 two tissues. Turning the concentration prior up to 1e4 recovers EM's answer, but
 only by forcing the weights to be equal, which is assuming the conclusion. The
 real lesson is that neither estimator knows where the brain is: three Gaussians
-on intensity alone cannot see that tissue comes in connected sheets. That is
-what a spatial prior is for, and it is why real segmentation tools carry one.
+on intensity alone cannot see that tissue comes in connected sheets.
+
+That is what `--mrf` is for, and it is on by default. A Markov random field adds
+a term rewarding agreement with neighbouring voxels, so a lone white-matter voxel
+surrounded by grey matter is asked to justify itself and usually cannot. It is
+the cheapest possible spatial prior and it is most of what separates this script
+from a tool you would actually publish with.
+
+Run it with `--mrf 0` to see what it is doing, and note that the argument to give
+the bias-corrected image matters at least as much: see `n4_correct`.
 """
 import argparse
 
@@ -48,6 +56,16 @@ p.add_argument(
     "--vb",
     action="store_true",
     help="variational Bayes instead of EM (see the note at the top of this file)",
+)
+p.add_argument(
+    "--mrf",
+    type=float,
+    default=0.7,
+    metavar="BETA",
+    help="strength of the spatial prior; 0 disables it (default: 0.7)",
+)
+p.add_argument(
+    "--mrf-iterations", type=int, default=6, help="ICM sweeps over the volume (default: 6)"
 )
 p.add_argument("--seed", type=int, default=302)
 args = p.parse_args()
@@ -99,8 +117,47 @@ rank = np.empty_like(order)
 rank[order] = np.arange(1, args.classes + 1)  # 1=CSF  2=GM  3=WM
 # ---------------------------------------------------------------------------
 
+assignment = posterior.argmax(axis=1)
+
+if args.mrf > 0:
+    # A Potts prior, minimised by iterated conditional modes.
+    #
+    # The mixture treats every voxel as an independent draw, which is the thing
+    # wrong with it: brains are not a fine mist of tissue types, they are
+    # connected sheets. So add a term that rewards agreeing with your
+    # neighbours, and re-decide each voxel given the labels around it:
+    #
+    #     score(voxel = k) = log P(intensity | k) + beta * (neighbours labelled k)
+    #
+    # beta is what a voxel's own intensity is worth against the company it keeps.
+    # Too small and nothing changes; too large and the volume collapses to one
+    # label. It is a knob, and being explicit about it is more honest than the
+    # alternative, which is pretending segmentation has no knobs.
+    from scipy import ndimage
+
+    neighbourhood = ndimage.generate_binary_structure(3, 1).astype("float32")
+    neighbourhood[1, 1, 1] = 0  # a voxel is not its own neighbour
+
+    data_term = np.log(posterior + 1e-12)
+    volume = np.zeros(data.shape, dtype="uint8")
+
+    for sweep in range(args.mrf_iterations):
+        volume[brain] = assignment + 1
+        scores = np.empty_like(data_term)
+        for k in range(args.classes):
+            agree = ndimage.convolve(
+                (volume == k + 1).astype("float32"), neighbourhood, mode="constant"
+            )
+            scores[:, k] = data_term[:, k] + args.mrf * agree[brain]
+        updated = scores.argmax(axis=1)
+        changed = int((updated != assignment).sum())
+        assignment = updated
+        print(f"  MRF sweep {sweep + 1}: {changed} voxels changed label")
+        if changed == 0:
+            break
+
 labels = np.zeros(data.shape, dtype="uint8")
-labels[brain] = rank[posterior.argmax(axis=1)]
+labels[brain] = rank[assignment]
 
 # A fresh header on purpose: inheriting the input's would carry its
 # scl_slope/scl_inter onto integer labels and quietly rescale them.

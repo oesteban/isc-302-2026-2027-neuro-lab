@@ -68,6 +68,7 @@ RUN --mount=from=wheels,source=/wheels,target=/wheels \
         scipy \
         nibabel \
         scikit-learn \
+        SimpleITK \
         niimath \
         ipyniivue \
         jupyter \
@@ -80,9 +81,10 @@ ENV FREESURFER_HOME=/opt/synthstrip
 COPY --from=synthstrip /freesurfer/models/        ${FREESURFER_HOME}/models/
 COPY --from=synthstrip /freesurfer/mri_synthstrip /usr/local/bin/mri_synthstrip
 
-COPY scripts/simple_strip scripts/tissue_segment scripts/tissue_volumes /usr/local/bin/
+COPY scripts/simple_strip scripts/n4_correct scripts/tissue_segment scripts/tissue_volumes /usr/local/bin/
 RUN chmod +x /usr/local/bin/mri_synthstrip \
              /usr/local/bin/simple_strip \
+             /usr/local/bin/n4_correct \
              /usr/local/bin/tissue_segment \
              /usr/local/bin/tissue_volumes \
     # the niimath wheel ships its binary without the execute bit and its Python
